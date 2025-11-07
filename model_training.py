@@ -13,33 +13,30 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, precision_recall_fscore_support, average_precision_score, roc_auc_score
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer
-from datasets import Dataset, DatasetDict, Features, Sequence, Value
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer, EarlyStoppingCallback
+from datasets import Dataset, DatasetDict, Features, Value
 from torch.utils.data import WeightedRandomSampler
 
-# ------------- Config -------------
+# ---------------- Config ----------------
 seed = 42
-model_name = "distilbert/distilbert-base-multilingual-cased"  # multilingual DistilBERT works well for English too
-max_len = 160  # modest length for better context than 128
-epochs_phase1 = 2
-epochs_phase2 = 1  # short polish with a bit more trainable capacity
+model_name = "distilbert/distilbert-base-uncased"
+max_len = 192                 # slightly higher than 160 to capture more cues
+epochs = 3                    # allow a bit more learning; early stopping will cap
 lr = 2e-5
-train_bs = 16
-eval_bs = 64
-grad_accum = 2
-logging_steps = 150
-out_dir = Path("outputs_english_only_balanced")
+weight_decay = 0.02
+train_bs = 24                 # raise if VRAM allows
+eval_bs = 128
+grad_accum = 1
+target_evals_per_epoch = 9    # aim for 8-10 evals per epoch
+logging_steps = 150           # frequent enough to see loss trends
+out_dir = Path("outputs_english_binary_toxic_stepwise")
 out_dir.mkdir(parents=True, exist_ok=True)
 
-# Jigsaw English files (replace with your exact paths)
+# Data paths (adjust)
 base = Path(r"C:\Users\hvpur\OneDrive\Desktop\sem 7\Deep Learning")
-english_files = {
-    "tox":  base / "jigsaw-toxic-comment-train.csv",
-    "bias": base / "jigsaw-unintended-bias-train.csv",
-}
-
-CATS = ["toxic", "severe_toxic", "obscene", "threat", "insult", "identity_hate"]
+tox_csv = base / "jigsaw-toxic-comment-train.csv"
+bias_csv = base / "jigsaw-unintended-bias-train.csv"   # optional English extra
 
 def set_seeds(sd):
     random.seed(sd); np.random.seed(sd); torch.manual_seed(sd)
@@ -48,120 +45,133 @@ def pick_text_col(df):
     for c in ["comment_text", "text", "content"]:
         if c in df.columns:
             return c
-    raise ValueError(f"No text column found; got: {list(df.columns)}")
+    raise ValueError(f"No text column found in columns {list(df.columns)}")
 
-def load_english_only():
-    df_tox = pd.read_csv(english_files["tox"])
+def load_binary_english():
+    df_tox = pd.read_csv(tox_csv)
     tcol = pick_text_col(df_tox)
-    present = [c for c in CATS if c in df_tox.columns]
-    if not present and "toxic" in df_tox.columns:
-        present = ["toxic"]
-    df_tox = df_tox[[tcol] + present].dropna().rename(columns={tcol: "text"})
-    for c in present:
-        df_tox[c] = df_tox[c].astype(int)
+    if "toxic" not in df_tox.columns:
+        raise ValueError("Expected 'toxic' column in jigsaw-toxic-comment-train.csv")
+    df_tox = df_tox[[tcol, "toxic"]].dropna().rename(columns={tcol: "text"})
+    df_tox["label"] = df_tox["toxic"].astype(int)
+    df_tox = df_tox[["text", "label"]]
 
-    # Optional: use unintended-bias as extra English data by binarizing toxicity score if present
-    df_bias = pd.read_csv(english_files["bias"])
-    btxt = pick_text_col(df_bias)
-    score_col = next((c for c in ["toxicity", "target", "toxic"] if c in df_bias.columns), None)
-    if score_col is None:
-        # fall back to only df_tox
-        df_train_all = df_tox.copy()
-        cats = sorted(list(set(present) | set(CATS)))
-        for c in cats:
-            if c not in df_train_all.columns:
-                df_train_all[c] = 0
-        return df_train_all[["text"] + cats], cats
+    # Optional: modest English boost from unintended-bias
+    extra = []
+    if bias_csv.exists():
+        df_bias = pd.read_csv(bias_csv)
+        btxt = pick_text_col(df_bias)
+        score_col = next((c for c in ["toxicity", "target", "toxic"] if c in df_bias.columns), None)
+        if score_col:
+            df_b = df_bias[[btxt, score_col]].dropna().rename(columns={btxt: "text", score_col: "score"})
+            df_b["label"] = (df_b["score"] >= 0.5).astype(int)
+            # cap size to control runtime
+            df_b = df_b.sample(n=min(len(df_b), 100_000), random_state=seed)
+            extra.append(df_b[["text", "label"]])
+    df_all = pd.concat([df_tox] + extra, ignore_index=True) if extra else df_tox.copy()
+    df_all = df_all.dropna(subset=["text"]).reset_index(drop=True)
+    df_all["text"] = df_all["text"].astype(str).str.strip()
+    df_all = df_all[df_all["text"] != ""]
+    return df_all
 
-    df_bias_bin = df_bias[[btxt, score_col]].dropna().rename(columns={btxt: "text", score_col: "score"})
-    df_bias_bin["toxic"] = (df_bias_bin["score"] >= 0.5).astype(int)
-    df_bias_bin = df_bias_bin[["text", "toxic"]]
+def df_to_hfds(df):
+    feats = Features({"text": Value("string"), "label": Value("int64")})
+    return Dataset.from_pandas(df.reset_index(drop=True), features=feats, preserve_index=False)
 
-    cats = sorted(list(set(present) | {"toxic"}))
-    for c in cats:
-        if c not in df_tox.columns:
-            df_tox[c] = 0
-        if c not in df_bias_bin.columns:
-            df_bias_bin[c] = 0
+def make_splits(df):
+    train_df, temp_df = train_test_split(df, test_size=0.2, random_state=seed, stratify=df["label"])
+    dev_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=seed, stratify=temp_df["label"])
+    return train_df, dev_df, test_df
 
-    df_train_all = pd.concat([df_tox[["text"] + cats], df_bias_bin[["text"] + cats]], ignore_index=True)
-    return df_train_all, cats
+def compute_class_weights(labels_np):
+    pos = labels_np.sum()
+    neg = labels_np.shape[0] - pos
+    total = len(labels_np)
+    w0 = total / (2.0 * max(1, neg))
+    w1 = total / (2.0 * max(1, pos))
+    return torch.tensor([w0, w1], dtype=torch.float32)
 
-def df_to_hfds(df, cats):
-    out = df.copy()
-    out[cats] = out[cats].astype(np.float32)
-    out["labels"] = out[cats].values.tolist()
-    out = out[["text", "labels"]]
-    features = Features({"text": Value("string"), "labels": Sequence(Value("float32"))})
-    return Dataset.from_pandas(out.reset_index(drop=True), features=features, preserve_index=False)
-
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    probs = torch.sigmoid(torch.tensor(logits)).numpy()
-    labels = np.array(labels)
-    preds = (probs >= 0.5).astype(int)
-    _, _, f_micro, _ = precision_recall_fscore_support(labels, preds, average="micro", zero_division=0)
-    _, _, f_macro, _ = precision_recall_fscore_support(labels, preds, average="macro", zero_division=0)
-    out = {"f1_micro": f_micro, "f1_macro": f_macro}
-    pr_aucs, roc_aucs = [], []
-    for j in range(probs.shape[1]):
-        if len(np.unique(labels[:, j])) > 1:
-            pr_aucs.append(average_precision_score(labels[:, j], probs[:, j]))
-            try:
-                roc_aucs.append(roc_auc_score(labels[:, j], probs[:, j]))
-            except ValueError:
-                pass
-    if pr_aucs:
-        out["pr_auc_macro"] = float(np.mean(pr_aucs))
-    if roc_aucs:
-        out["roc_auc_macro"] = float(np.mean(roc_aucs))
-    return out
-
-def freeze_for_speed(model, num_frozen=3):
-    if hasattr(model, "distilbert"):
-        for p in model.distilbert.embeddings.parameters():
-            p.requires_grad = False
-        for i, layer in enumerate(model.distilbert.transformer.layer):
-            if i < num_frozen:
-                for p in layer.parameters():
-                    p.requires_grad = False
-    return model
-
-def build_balanced_sampler_and_pos_weight(train_labels_np):
-    pos_counts = train_labels_np.sum(axis=0)
-    neg_counts = train_labels_np.shape[0] - pos_counts
-    # pos_weight = neg/pos per label (clamped for stability)
-    pos_weight_cpu = torch.tensor((neg_counts / np.clip(pos_counts, 1.0, None)).astype(np.float32))
-    pos_weight_cpu = torch.clamp(pos_weight_cpu, 1.0, 10.0)  # avoid extremes [web:218][web:230][web:219]
-    # sample weights per example: sum of inverse class frequency for its positive labels
-    class_weights = 1.0 / np.clip(pos_counts + 1e-6, 1e-6, None)
-    sample_weights = (train_labels_np * class_weights).sum(axis=1)
-    sample_weights = sample_weights + (sample_weights == 0) * (class_weights.mean() * 0.1)
-    sampler = WeightedRandomSampler(
+def build_sampler(labels_np):
+    class_counts = np.bincount(labels_np, minlength=2)
+    class_weights = 1.0 / np.clip(class_counts, 1, None)
+    sample_weights = class_weights[labels_np]
+    return WeightedRandomSampler(
         weights=torch.DoubleTensor(sample_weights),
         num_samples=len(sample_weights),
         replacement=True
     )
-    return sampler, pos_weight_cpu
 
-class PosWeightTrainer(Trainer):
-    def __init__(self, *args, pos_weight_cpu=None, **kwargs):
-        self._pos_weight_cpu = pos_weight_cpu
+def bin_metrics(eval_pred):
+    logits, labels = eval_pred
+    probs = torch.softmax(torch.tensor(logits), dim=-1).numpy()
+    preds = probs.argmax(axis=1)
+    labels = np.array(labels)
+    acc = accuracy_score(labels, preds)
+    p, r, f1, _ = precision_recall_fscore_support(labels, preds, average="binary", zero_division=0)
+    try:
+        auc = roc_auc_score(labels, probs[:, 1])
+    except Exception:
+        auc = float("nan")
+    return {"accuracy": acc, "precision": p, "recall": r, "f1": f1, "roc_auc": auc}
+
+def save_logs_and_plots(out_dir: Path):
+    state_path = out_dir / "trainer_state.json"
+    if not state_path.exists():
+        return
+    st = json.loads(state_path.read_text(encoding="utf-8"))
+    logs = st.get("log_history", [])
+    df_logs = pd.json_normalize(logs)
+    if "step" not in df_logs and "global_step" in df_logs.columns:
+        df_logs["step"] = df_logs["global_step"]
+    df_logs.to_csv(out_dir / "metrics_log.csv", index=False)
+
+    def plot(df, out_png, title, ys):
+        if df.empty:
+            return
+        plt.figure(figsize=(9,5))
+        for y in ys:
+            if y in df.columns:
+                plt.plot(df["step"], df[y], label=y)
+        plt.title(title); plt.xlabel("step"); plt.ylabel("value")
+        plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+        plt.savefig(out_png, dpi=150); plt.close()
+
+    plot(df_logs.dropna(subset=["loss"]), out_dir / "train_loss.png", "Training Loss vs Step", ["loss"])
+    plot(df_logs.dropna(subset=["eval_loss"]), out_dir / "eval_loss.png", "Eval Loss vs Step", ["eval_loss"])
+    plot(df_logs.dropna(subset=["eval_accuracy","eval_precision","eval_recall","eval_f1"]),
+         out_dir / "eval_metrics.png", "Eval Metrics vs Step", ["eval_accuracy","eval_precision","eval_recall","eval_f1"])
+
+def choose_eval_steps(train_size, eff_batch_per_step, target_evals=9):
+    steps_per_epoch = max(1, int(np.ceil(train_size / eff_batch_per_step)))
+    eval_steps = max(200, steps_per_epoch // target_evals)
+    return eval_steps, steps_per_epoch
+
+def tune_threshold_custom(probs_pos, labels, w_precision=0.6, w_recall=0.4):
+    y = np.array(labels)
+    candidates = np.unique(np.concatenate([[0.0, 1.0], probs_pos]))
+    best_val, best_t = -1.0, 0.5
+    for t in candidates:
+        preds = (probs_pos >= t).astype(int)
+        p, r, f1, _ = precision_recall_fscore_support(y, preds, average="binary", zero_division=0)
+        val = w_precision * p + w_recall * r
+        if val > best_val:
+            best_val, best_t = val, t
+    return float(best_t), float(best_val)
+
+class ClassWeightedTrainer(Trainer):
+    def __init__(self, *args, class_weights_cpu=None, **kwargs):
         super().__init__(*args, **kwargs)
-        self._bce = None
+        self._class_weights_cpu = class_weights_cpu
+        self._ce = None
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.pop("labels")
-        device = model.device
-        labels = labels.to(device)
-        # Build/refresh BCEWithLogitsLoss on correct device with pos_weight [web:230]
-        if (self._bce is None) or (getattr(self._bce, 'pos_weight', None) is not None and self._bce.pos_weight.device != device):
-            pos_weight = None
-            if self._pos_weight_cpu is not None:
-                pos_weight = self._pos_weight_cpu.to(device)
-            self._bce = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         outputs = model(**inputs)
         logits = outputs.logits
-        loss = self._bce(logits, labels)
+        device = model.device
+        if self._ce is None or (getattr(self._ce, "weight", None) is not None and self._ce.weight.device != device):
+            w = None if self._class_weights_cpu is None else self._class_weights_cpu.to(device)
+            self._ce = torch.nn.CrossEntropyLoss(weight=w)
+        loss = self._ce(logits, labels.to(device))
         return (loss, outputs) if return_outputs else loss
     def get_train_dataloader(self):
         dl = super().get_train_dataloader()
@@ -169,239 +179,119 @@ class PosWeightTrainer(Trainer):
             dl.sampler = self._sampler
         return dl
 
-def tune_thresholds(dev_logits, dev_labels, grid=None):
-    if grid is None:
-        grid = np.linspace(0.1, 0.9, 33)
-    probs = torch.sigmoid(torch.tensor(dev_logits)).numpy()
-    labels = np.array(dev_labels)
-    best_thr = [0.5] * probs.shape[1]
-    for j in range(probs.shape[1]):
-        if len(np.unique(labels[:, j])) < 2:
-            best_thr[j] = 0.5
-            continue
-        best_f1, best_t = -1.0, 0.5
-        for t in grid:
-            preds = (probs[:, j] >= t).astype(int)
-            f1 = f1_score(labels[:, j], preds, zero_division=0)
-            if f1 > best_f1:
-                best_f1, best_t = f1, t
-        best_thr[j] = float(best_t)
-    return best_thr
-
-def eval_with_thresholds(trainer, dataset, thresholds):
-    out = trainer.predict(dataset)
-    probs = torch.sigmoid(torch.tensor(out.predictions)).numpy()
-    labels = np.array(out.label_ids)
-    thr = np.array(thresholds, dtype=float)
-    preds = (probs >= thr.reshape(1, -1)).astype(int)
-    _, _, f_micro, _ = precision_recall_fscore_support(labels, preds, average="micro", zero_division=0)
-    _, _, f_macro, _ = precision_recall_fscore_support(labels, preds, average="macro", zero_division=0)
-    pr_aucs, roc_aucs = [], []
-    for j in range(probs.shape[1]):
-        if len(np.unique(labels[:, j])) > 1:
-            pr_aucs.append(average_precision_score(labels[:, j], probs[:, j]))
-            try:
-                roc_aucs.append(roc_auc_score(labels[:, j], probs[:, j]))
-            except ValueError:
-                pass
-    out = {"f1_micro": f_micro, "f1_macro": f_macro}
-    if pr_aucs:
-        out["pr_auc_macro"] = float(np.mean(pr_aucs))
-    if roc_aucs:
-        out["roc_auc_macro"] = float(np.mean(roc_aucs))
-    return out
-
-def save_logs_and_plots(out_dir: Path):
-    state_path = out_dir / "trainer_state.json"
-    csv_path = out_dir / "metrics_log.csv"
-    if not state_path.exists():
-        print("trainer_state.json not found; but trainer.save_state() was called – check permissions or output_dir.")
-        return
-    st = json.loads(state_path.read_text(encoding="utf-8"))
-    logs = st.get("log_history", [])
-    df_logs = pd.json_normalize(logs)
-    if "step" not in df_logs.columns and "global_step" in df_logs.columns:
-        df_logs["step"] = df_logs["global_step"]
-    df_logs.to_csv(csv_path, index=False)
-    print("Wrote metrics CSV:", csv_path.resolve().as_posix())
-
-    def plot_and_save(df_logs: pd.DataFrame, out_png: Path, title: str, x_col: str, y_cols: list):
-        if df_logs.empty:
-            return
-        plt.figure(figsize=(9, 5))
-        for y in y_cols:
-            if y in df_logs.columns:
-                plt.plot(df_logs[x_col], df_logs[y], label=y)
-        plt.title(title); plt.xlabel(x_col); plt.ylabel("value")
-        plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
-        plt.savefig(out_png, dpi=150); plt.close()
-        print("Saved graph:", out_png.resolve().as_posix())
-
-    if "loss" in df_logs:
-        plot_and_save(df_logs.dropna(subset=["loss"]), out_dir / "train_loss.png", "Training Loss vs Step", "step", ["loss"])
-    if "eval_loss" in df_logs:
-        plot_and_save(df_logs.dropna(subset=["eval_loss"]), out_dir / "eval_loss.png", "Eval Loss vs Step", "step", ["eval_loss"])
-    cols = [c for c in ["eval_f1_micro", "eval_f1_macro", "eval_pr_auc_macro", "eval_roc_auc_macro"] if c in df_logs.columns]
-    if cols:
-        plot_and_save(df_logs.dropna(subset=cols), out_dir / "eval_metrics.png", "Eval Metrics vs Step", "step", cols)
-
 def main():
     set_seeds(seed)
 
-    # 1) Data: English only
-    df_all, cats = load_english_only()
-    # Train/dev/test split within English (stratify by any-positive)
-    pos_flag = (df_all[cats].sum(axis=1) > 0).astype(int)
-    train_df, temp_df = train_test_split(df_all, test_size=0.2, random_state=seed, stratify=pos_flag)
-    pos_flag_temp = (temp_df[cats].sum(axis=1) > 0).astype(int)
-    dev_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=seed, stratify=pos_flag_temp)
+    # 1) Load/split
+    df_all = load_binary_english()
+    train_df, dev_df, test_df = make_splits(df_all)
 
-    raw = DatasetDict({
-        "train": df_to_hfds(train_df, cats),
-        "dev":   df_to_hfds(dev_df,   cats),
-        "val":   df_to_hfds(dev_df,   cats),   # use dev as validation for reporting
-        "test":  df_to_hfds(test_df,  cats),
+    ds = DatasetDict({
+        "train": df_to_hfds(train_df),
+        "dev":   df_to_hfds(dev_df),
+        "test":  df_to_hfds(test_df),
     })
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-
-    def tokenize(batch):
+    def tok(batch):
         return tokenizer(batch["text"], padding="max_length", truncation=True, max_length=max_len)
+    ds_tok = ds.map(tok, batched=True, remove_columns=["text"])
+    ds_tok.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
 
-    tokenized = raw.map(tokenize, batched=True, remove_columns=["text"])
-    tokenized.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+    # 2) Sampler/weights
+    y_train = np.array(ds_tok["train"]["label"])
+    class_weights_cpu = compute_class_weights(y_train)
+    sampler = build_sampler(y_train)
 
-    # Sampler + pos_weight from train labels
-    train_labels_np = np.array(tokenized["train"]["labels"])
-    sampler, pos_weight_cpu = build_balanced_sampler_and_pos_weight(train_labels_np)
+    # 3) Determine eval_steps adaptively for ~9 evals per epoch
+    eff_batch = train_bs * max(1, torch.cuda.device_count()) * grad_accum
+    eval_steps, steps_per_epoch = choose_eval_steps(len(ds_tok["train"]), eff_batch, target_evals_per_epoch)
+    print(f"steps_per_epoch={steps_per_epoch}, eval_steps={eval_steps}")
 
-    # 2) Phase 1: freeze lower layers for speed
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_name,
-        num_labels=len(cats),
-        problem_type="multi_label_classification",
-    )
-    model = freeze_for_speed(model, num_frozen=3)
+    # 4) Model
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2, problem_type="single_label_classification")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     print("CUDA available:", torch.cuda.is_available(), "Device:", next(model.parameters()).device)
 
-    args1 = TrainingArguments(
-        output_dir=str(out_dir / "phase1"),
-        do_train=True,
-        do_eval=True,
+    # 5) TrainingArguments: step-based eval, warmup+cosine, early stopping on F1
+    total_train_steps = steps_per_epoch * epochs
+    warmup_steps = max(100, int(0.06 * total_train_steps))
+
+    args = TrainingArguments(
+        output_dir=str(out_dir),
+        do_train=True, do_eval=True,
         learning_rate=lr,
         per_device_train_batch_size=train_bs,
         per_device_eval_batch_size=eval_bs,
         gradient_accumulation_steps=grad_accum,
-        num_train_epochs=epochs_phase1,
-        weight_decay=0.01,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True,
-        metric_for_best_model="f1_macro",
-        greater_is_better=True,
+        num_train_epochs=epochs,
+        weight_decay=weight_decay,
+        eval_strategy="steps",
+        eval_steps=eval_steps,
+        save_strategy="steps",
+        save_steps=eval_steps,
         logging_strategy="steps",
         logging_steps=logging_steps,
+        load_best_model_at_end=True,
+        metric_for_best_model="f1",
+        greater_is_better=True,
+        lr_scheduler_type="cosine",
+        warmup_steps=warmup_steps,
         fp16=torch.cuda.is_available(),
         seed=seed,
         dataloader_num_workers=0,
-        save_total_limit=2,
+        save_total_limit=3,
         report_to=[],
     )
 
-    trainer1 = PosWeightTrainer(
+    trainer = ClassWeightedTrainer(
         model=model,
-        args=args1,
-        train_dataset=tokenized["train"],
-        eval_dataset=tokenized["dev"],
+        args=args,
+        train_dataset=ds_tok["train"],
+        eval_dataset=ds_tok["dev"],
         tokenizer=tokenizer,
-        compute_metrics=compute_metrics,
-        pos_weight_cpu=pos_weight_cpu,
+        compute_metrics=bin_metrics,
+        class_weights_cpu=class_weights_cpu,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=4, early_stopping_threshold=1e-4)]
     )
-    # attach sampler
-    trainer1._sampler = sampler
+    trainer._sampler = sampler
 
-    trainer1.train()
-    trainer1.save_state()
-    trainer1.save_model(str(out_dir / "phase1_final"))
+    # 6) Train
+    trainer.train()
+    trainer.save_state()
+    trainer.save_model(str(out_dir / "final_model"))
+    tokenizer.save_pretrained(str(out_dir / "final_model"))
 
-    # 3) Phase 2: unfreeze one more top block for polishing (short)
-    if hasattr(model, "distilbert"):
-        layers = list(model.distilbert.transformer.layer)
-        # Unfreeze the topmost block
-        for p in layers[-1].parameters():
-            p.requires_grad = True
+    # 7) Precision-leaning threshold tuning on dev
+    dev_out = trainer.predict(ds_tok["dev"])
+    probs_dev = torch.softmax(torch.tensor(dev_out.predictions), dim=-1).numpy()[:, 1]
+    best_thr, best_custom = tune_threshold_custom(probs_dev, np.array(dev_out.label_ids),
+                                                  w_precision=0.6, w_recall=0.4)
 
-    # Ensure model remains on device after unfreezing
-    model.to(device)
+    # 8) Evaluate on test with tuned threshold
+    test_out = trainer.predict(ds_tok["test"])
+    probs_test = torch.softmax(torch.tensor(test_out.predictions), dim=-1).numpy()[:, 1]
+    preds_test = (probs_test >= best_thr).astype(int)
+    y_test = np.array(test_out.label_ids)
 
-    args2 = TrainingArguments(
-        output_dir=str(out_dir / "phase2"),
-        do_train=True,
-        do_eval=True,
-        learning_rate=lr,
-        per_device_train_batch_size=train_bs,
-        per_device_eval_batch_size=eval_bs,
-        gradient_accumulation_steps=grad_accum,
-        num_train_epochs=epochs_phase2,
-        weight_decay=0.01,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True,
-        metric_for_best_model="f1_macro",
-        greater_is_better=True,
-        logging_strategy="steps",
-        logging_steps=logging_steps,
-        fp16=torch.cuda.is_available(),
-        seed=seed,
-        dataloader_num_workers=0,
-        save_total_limit=2,
-        report_to=[],
-    )
+    acc = accuracy_score(y_test, preds_test)
+    p, r, f1, _ = precision_recall_fscore_support(y_test, preds_test, average="binary", zero_division=0)
+    try:
+        auc = roc_auc_score(y_test, probs_test)
+    except Exception:
+        auc = float("nan")
+    metrics = {"test_accuracy": acc, "test_precision": p, "test_recall": r, "test_f1": f1, "test_auc": auc,
+               "threshold": best_thr}
+    print(metrics)
 
-    trainer2 = PosWeightTrainer(
-        model=model,
-        args=args2,
-        train_dataset=tokenized["train"],
-        eval_dataset=tokenized["dev"],
-        tokenizer=tokenizer,
-        compute_metrics=compute_metrics,
-        pos_weight_cpu=pos_weight_cpu,
-    )
-    trainer2._sampler = sampler
+    with open(out_dir / "threshold.json", "w", encoding="utf-8") as f:
+        json.dump({"threshold": best_thr}, f, indent=2)
+    with open(out_dir / "final_metrics.json", "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
 
-    trainer2.train()
-    trainer2.save_state()
-    trainer2.save_model(str(out_dir / "phase2_final"))
-
-    # 4) Evaluate and threshold tuning on English dev
-    val_default = trainer2.evaluate(eval_dataset=tokenized["val"])
-    test_default = trainer2.evaluate(eval_dataset=tokenized["test"])
-    print("Validation (default thr=0.5):", val_default)
-    print("Test (default thr=0.5):", test_default)
-
-    dev_out = trainer2.predict(tokenized["dev"])
-    best_thresholds = tune_thresholds(dev_out.predictions, dev_out.label_ids)
-    thr_map = dict(zip(cats, best_thresholds))
-    print("Per-label thresholds (dev-tuned):", thr_map)
-
-    val_tuned = eval_with_thresholds(trainer2, tokenized["val"], best_thresholds)
-    test_tuned = eval_with_thresholds(trainer2, tokenized["test"], best_thresholds)
-    print("Validation (tuned):", val_tuned)
-    print("Test (tuned):", test_tuned)
-
-    # 5) Save export with thresholds for the English model
-    export_dir = out_dir / "best_english_only"
-    trainer2.save_model(str(export_dir))
-    tokenizer.save_pretrained(str(export_dir))
-    with open(export_dir / "thresholds.json", "w", encoding="utf-8") as f:
-        json.dump({"categories": cats, "thresholds": best_thresholds}, f, ensure_ascii=False, indent=2)
-    print("Saved to:", export_dir.resolve().as_posix())
-
-    # 6) Save logs + plots for both phases
-    save_logs_and_plots(out_dir / "phase1")
-    save_logs_and_plots(out_dir / "phase2")
+    # 9) Plots
+    save_logs_and_plots(out_dir)
 
 if __name__ == "__main__":
     main()
